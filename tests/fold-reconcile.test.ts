@@ -770,7 +770,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");
@@ -853,11 +853,16 @@ describe("rewrite-suspect detection (#2396)", () => {
     const oldCall = msg("tc1", "tool_result", "payload body words", { toolCallId: "call_seed|fc_0", toolName: "probe" });
     const rewrittenTwin = msg("tc1-rw", "tool_result", "payload body words", { toolCallId: "call_seed_fc_0", toolName: "probe" });
 
-    test("identical-content twin under a different toolCallId is counted, never claimed", () => {
+    test("identical-content twin under a different toolCallId is claimed by the twin pass (#2915)", () => {
+        // #2396 shipped this as detection-only on the "misattribution >
+        // non-recognition" principle; #2915 observes the safe corner: the bytes
+        // are byte-identical and only the protocol-volatile id moved, so the
+        // exact no-toolCallId content identity is proof, not a guess.
         const plan = planReconciliation(["tc1"], { tc1: anchorOf(oldCall) }, [rewrittenTwin], new Set(["tc1"]));
-        assert.equal(plan.claims.size, 0, "no host knowledge → no pairing");
-        assert.deepEqual(plan.unmatched, ["tc1"]);
-        assert.equal(plan.idRewriteSuspects, 1);
+        assert.equal(plan.byTwin, 1);
+        assert.deepEqual([...plan.claims.entries()], [["tc1", ["tc1-rw"]]]);
+        assert.deepEqual(plan.unmatched, []);
+        assert.equal(plan.idRewriteSuspects, 0, "claimed — no residual suspect");
     });
 
     test("stable toolCallId with churned bytes still claims (unchanged path)", () => {
@@ -954,6 +959,110 @@ describe("rewrite-suspect detection (#2396)", () => {
             assert.equal(anchors[m.id!]?.m, normalizedIdentityNoToolCallId(m), "m backfilled from live bytes");
             assert.equal(anchors[m.id!]?.n, normalizedIdentity(m));
         }
+    });
+
+    test("twin pass claims rewritten tool-call ids with no positional copy (#2915)", () => {
+        // The dsh shape: no stored foldPositions (Pass 0 disabled) and every
+        // tool-call id rewritten on the replay. Pass 1/2 miss by construction;
+        // Pass 5 pairs the exact no-toolCallId content identity.
+        const oldOrder = ["u0", "c0", "t0", "u1", "c1", "t1"];
+        const anchors: Record<string, FoldAnchor> = {
+            u0: anchorOf(msg("u0", "user", "do the thing")),
+            c0: anchorOf(msg("c0", "assistant", '{"cmd":"ls"}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_0|raw" })),
+            t0: anchorOf(msg("t0", "tool", "listing zero", { contentType: "tool-result", toolName: "bash", toolCallId: "call_0|raw" })),
+            u1: anchorOf(msg("u1", "user", "and again")),
+            c1: anchorOf(msg("c1", "assistant", '{"cmd":"pwd"}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_1|raw" })),
+            t1: anchorOf(msg("t1", "tool", "listing one", { contentType: "tool-result", toolName: "bash", toolCallId: "call_1|raw" })),
+        };
+        const incoming: CoreMessage[] = [
+            msg("u0", "user", "do the thing"),
+            msg("c0n", "assistant", '{"cmd":"ls"}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_0_raw" }),
+            msg("t0n", "tool", "listing zero", { contentType: "tool-result", toolName: "bash", toolCallId: "call_0_raw" }),
+            msg("u1", "user", "and again"),
+            msg("c1n", "assistant", '{"cmd":"pwd"}', { contentType: "tool-call", toolName: "bash", toolCallId: "call_1_raw" }),
+            msg("t1n", "tool", "listing one", { contentType: "tool-result", toolName: "bash", toolCallId: "call_1_raw" }),
+        ];
+        const plan = planReconciliation(oldOrder, anchors, incoming, new Set(oldOrder));
+        assert.equal(plan.byTwin, 4, "every rewritten-id twin is claimed");
+        assert.deepEqual([...plan.claims.entries()], [["c0", ["c0n"]], ["t0", ["t0n"]], ["c1", ["c1n"]], ["t1", ["t1n"]]]);
+        assert.deepEqual(plan.unmatched, []);
+        assert.equal(plan.idRewriteSuspects, 0, "no residual suspect once claimed");
+    });
+
+    test("twin pass refuses a duplicate-content family whose counts disagree (#2915)", () => {
+        // Two covered results share content under two rewritten ids: pairing
+        // k-th to k-th would guess which old id died. Count mismatch → no claim.
+        const body = "identical tool output";
+        const oldOrder = ["a", "b"];
+        const anchors: Record<string, FoldAnchor> = {
+            a: anchorOf(msg("a", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_a|raw" })),
+            b: anchorOf(msg("b", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_b|raw" })),
+        };
+        const incoming = [msg("a2", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_a_raw" })];
+        const plan = planReconciliation(oldOrder, anchors, incoming, new Set(oldOrder));
+        assert.equal(plan.byTwin, 0);
+        assert.equal(plan.claims.size, 0);
+        assert.deepEqual(plan.unmatched.sort(), ["a", "b"]);
+        assert.equal(plan.idRewriteSuspects, 2, "residual suspects still counted for the log");
+    });
+
+    test("dsh model-switch shape: rewritten tool-call ids no longer destroy the substrate (#2915)", () => {
+        // The session-92d35565 shape: an interleaved reasoning/text/tool
+        // history replays with every tool-call id rewritten AND the reasoning
+        // cores dropped. Pass 0 breaks at the first count shift, so the tool
+        // twins are the only recoverable mass — without Pass 5 the drift
+        // latches "substrate destroyed" after three passes.
+        const originals: CoreMessage[] = [];
+        for (let t = 0; t < 8; t++) {
+            originals.push(msg(`u${t}`, "user", `user turn ${t}`));
+            originals.push(msg(`r${t}`, "assistant", `rs_${t}`, { contentType: "reasoning" }));
+            originals.push(msg(`a${t}`, "assistant", `reply ${t}`));
+            originals.push(msg(`c${t}`, "assistant", `{"cmd":"ls ${t}"}`, { contentType: "tool-call", toolName: "bash", toolCallId: `call_${t}|raw` }));
+            originals.push(msg(`tr${t}`, "tool", `output ${t}`, { contentType: "tool-result", toolName: "bash", toolCallId: `call_${t}|raw` }));
+        }
+        const session: Session = {
+            state: { blocks: [{ active: true, effectiveMessageIds: originals.map((m) => m.id!) }] },
+            metadata: {},
+        } as unknown as Session;
+        const opts: ReconcileOptions = { mode: "repair", sessionId: "dsh", log: () => {} };
+        reconcileFoldCoverage(session, originals, opts); // seed anchors + positional copy
+
+        const replay = (): CoreMessage[] => originals
+            .filter((m) => m.contentType !== "reasoning")
+            .map((m, i) => {
+                const id = `n${i}`;
+                if (m.toolCallId !== undefined) {
+                    return msg(id, m.role, m.text ?? "", { contentType: m.contentType, toolName: m.toolName, toolCallId: `call_${m.toolCallId.split("|")[0]}_raw` });
+                }
+                return msg(id, m.role, m.text ?? "", { contentType: m.contentType });
+            });
+
+        const logs: { level: string; msg: string }[] = [];
+        const logging: ReconcileOptions = { mode: "repair", sessionId: "dsh", log: (l, m) => logs.push({ level: l, msg: m }) };
+        let last = reconcileFoldCoverage(session, replay(), logging);
+        assert.ok(last.byTwin >= 14, `the tool twins are reclaimed (got ${last.byTwin})`);
+        // two more passes must not latch the destroy escalation
+        reconcileFoldCoverage(session, replay(), logging);
+        last = reconcileFoldCoverage(session, replay(), logging);
+        assert.equal(session.metadata.foldDriftEscalated, undefined, "the recoverable identity rewrite is not substrate destruction");
+        assert.equal(logs.filter((l) => l.level === "error").length, 0, "no escalation error line");
+    });
+
+    test("twin pass pairs a matching duplicate family k-th to k-th (#2915)", () => {
+        const body = "identical tool output";
+        const oldOrder = ["a", "b"];
+        const anchors: Record<string, FoldAnchor> = {
+            a: anchorOf(msg("a", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_a|raw" })),
+            b: anchorOf(msg("b", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_b|raw" })),
+        };
+        const incoming = [
+            msg("a2", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_a_raw" }),
+            msg("b2", "tool", body, { contentType: "tool-result", toolName: "bash", toolCallId: "call_b_raw" }),
+        ];
+        const plan = planReconciliation(oldOrder, anchors, incoming, new Set(oldOrder));
+        assert.equal(plan.byTwin, 2);
+        assert.deepEqual([...plan.claims.entries()], [["a", ["a2"]], ["b", ["b2"]]]);
+        assert.deepEqual(plan.unmatched, []);
     });
 });
 

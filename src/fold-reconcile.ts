@@ -26,16 +26,17 @@
 // protocol-unique tool id or full normalized-text equality at the same
 // duplicate-ordinal inside the aligned churn region — never fuzzy similarity.
 //
-// A third signal is DETECTION-ONLY (#2396): a host may REWRITE authoritative
-// tool-call ids itself (a provider projection re-sanitizing stored composite
-// ids — Prime switching one conversation from Codex to a foreign Responses
-// provider turned call_x|fc_0 into call_x_fc_0 on both sides of every pair).
-// That defeats both claim passes by construction, because both key on the
-// toolCallId. Pairing old→new without host knowledge would be guessing, and
-// misattribution is the expensive failure mode (MESSAGE-IDENTITY.md), so the
-// pass only COUNTS such cases (an inbound twin with identical normalized
-// content under a different toolCallId) and the drift log line names the
-// cause instead of reading as "mutation or deletion".
+// A third signal (#2396) is a host that REWRITES authoritative tool-call ids
+// (a provider projection re-sanitizing stored composite ids — Prime switching
+// one conversation from Codex to a foreign Responses provider turned
+// call_x|fc_0 into call_x_fc_0 on both sides of every pair; pi-ai's
+// transformMessages does the same cross-model, dsh's LLM seam). Pass 1 keys on
+// the toolCallId and Pass 2's normalized identity embeds it, so both miss by
+// construction. The no-toolCallId content identity is exact, so a UNIQUE
+// inbound twin is provably the same message — only the protocol-volatile id
+// moved. Pass 5 (#2915) claims those twins; the #2396 detector still counts
+// any residual suspects (no exact twin, count mismatch) so the drift log names
+// the cause instead of reading as "mutation or deletion".
 //
 // Pass 0 (#2480) — POSITIONAL identity, self-stored canonical copy. The
 // passes above re-derive identity from wire bytes, so a protocol switch that
@@ -224,6 +225,11 @@ interface ReconciliationPlan {
     byNorm: number;
     byTurn: number;
     byImage: number;
+    /** #2915: missing covered ids re-anchored onto an inbound twin whose ONLY
+     *  difference is a rewritten toolCallId (identical no-toolCallId content
+     *  identity) — the safe corner of the #2396 tradeoff, claimed only on a
+     *  unique witness. */
+    byTwin: number;
     /** Covered ids missing from the resent history with no match — either
      *  mutation (originals re-enter the wire unfolded) or benign client-side
      *  deletion/truncation (originals no longer on the wire) (#2297/#1195). */
@@ -256,6 +262,8 @@ interface FoldReconcileResult {
     byNorm: number;
     byTurn: number;
     byImage: number;
+    /** #2915: missing covered ids re-anchored onto a rewritten-id content twin. */
+    byTwin: number;
     /** #2695: fold blocks reaped this pass (removed from state.blocks after
      *  a majority-loss zombie streak). */
     reaped: number;
@@ -533,7 +541,7 @@ export function planReconciliation(
     covered: Set<string>,
     positions?: { ids: string[]; canon: string[] },
 ): ReconciliationPlan {
-    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined };
+    const plan: ReconciliationPlan = { claims: new Map(), byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, unmatched: [], idRewriteSuspects: 0, newOrder: [], nextCanon: undefined };
     // #2480: the positional copy is built on EVERY pass, so the first pass
     // after an upgrade establishes it and every later drift is
     // position-claimable. The fast path is reuse-by-ID (#2487): same id =
@@ -874,16 +882,76 @@ export function planReconciliation(
         }
     }
 
+    // Pass 5 — rewritten-toolCallId twin (#2915). A host replaying one
+    // conversation across provider projections may rewrite authoritative
+    // tool-call ids (call_x|fc_0 -> call_x_fc_0) while every other byte stays
+    // identical. Pass 1 keys on the toolCallId and Pass 2's normalized
+    // identity embeds it, so both miss by construction; #2396 only COUNTED
+    // these twins. The no-toolCallId content identity (role + contentType +
+    // toolName + normalized text) is exact, so a unique witness is provably
+    // the same message — the safe corner of the #2396 tradeoff (the bytes are
+    // identical; only the protocol-volatile id moved). Duplicate-content
+    // families pair k-th to k-th in conversation order (the same
+    // order-preserving discipline as Pass 2) and only when the counts agree;
+    // any count mismatch claims nothing and the ids fall through to the
+    // honest unmatched path. Candidates still carrying the anchor's own
+    // toolCallId are left to Pass 1/2 (claiming them here would pair on
+    // content the passes above already judged ambiguous).
+    if (missingMiddle.length > 0 && candidates.length > 0) {
+        const twinWitnesses = new Map<string, string[]>();
+        for (const cand of candidates) {
+            if (claimedCandidates.has(cand.id)) continue;
+            const t = cand.message.toolCallId;
+            if (t === undefined || t === "") continue;
+            const nt = normalizedIdentityNoToolCallId(cand.message);
+            const bucket = twinWitnesses.get(nt);
+            if (bucket === undefined) twinWitnesses.set(nt, [cand.id]);
+            else bucket.push(cand.id);
+        }
+        if (twinWitnesses.size > 0) {
+            const twinAnchors = new Map<string, string[]>();
+            for (const oldId of missingMiddle) {
+                if (plan.claims.has(oldId)) continue;
+                const anchor = anchors[oldId];
+                if (anchor === undefined || anchor.m === undefined || anchor.t === undefined) continue;
+                const bucket = twinAnchors.get(anchor.m);
+                if (bucket === undefined) twinAnchors.set(anchor.m, [oldId]);
+                else bucket.push(oldId);
+            }
+            for (const [norm, oldIds] of twinAnchors) {
+                const usable = (twinWitnesses.get(norm) ?? []).filter((id) => !claimedCandidates.has(id));
+                if (usable.length === 0 || usable.length !== oldIds.length) continue;
+                // Every pair must be a genuine rewrite (candidate toolCallId
+                // differs from its anchor's). A same-id pair belongs to Pass 1
+                // — if Pass 1 skipped it, the tool id was ambiguous and
+                // pairing on content would be a guess.
+                const pairs: [string, string][] = [];
+                let safe = true;
+                for (let k = 0; k < oldIds.length; k++) {
+                    const cand = byId.get(usable[k]);
+                    if (cand === undefined || cand.toolCallId === anchors[oldIds[k]]?.t) { safe = false; break; }
+                    pairs.push([oldIds[k], usable[k]]);
+                }
+                if (!safe) continue;
+                for (const [oldId, newId] of pairs) {
+                    plan.claims.set(oldId, [newId]);
+                    claimedCandidates.add(newId);
+                    plan.byTwin++;
+                }
+            }
+        }
+    }
+
     for (const id of missing) {
         if (!plan.claims.has(id)) plan.unmatched.push(id);
     }
 
-    // #2396 — detection-only rewrite suspects. Both claim passes key on the
-    // toolCallId itself, so a host that rewrites authoritative tool-call ids
-    // defeats them by construction; pairing old→new without host knowledge
-    // would be guessing (misattribution is the expensive failure mode). Cost:
-    // one no-toolCallId norm per unclaimed candidate carrying a toolCallId,
-    // drift passes only — steady state early-returns above (#2334 discipline).
+    // #2396 — residual rewrite suspects (detection). Pass 5 already claimed
+    // every exact-content twin; what is left here is evidence WITHOUT a safe
+    // pairing: no twin at all, or a duplicate-content family whose counts
+    // disagree (pairing then would guess which old id died). Cost: one
+    // no-toolCallId norm per unclaimed candidate carrying a toolCallId, drift
+    // passes only — steady state early-returns above (#2334 discipline).
     if (plan.unmatched.length > 0) {
         const noToolWitnesses = new Map<string, string[]>();
         for (const cand of candidates) {
@@ -965,13 +1033,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, reaped: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -984,9 +1052,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, reaped: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, reaped: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -1285,15 +1353,15 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, byTwin: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
             opts.log(plan.unmatched.length > 0 ? "warn" : "info",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional, ${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing — reanchored ${plan.claims.size} (${plan.byPos} positional, ${plan.byTool} by toolCallId, ${plan.byNorm} by normalized identity${plan.byTurn > 0 ? `, ${plan.byTurn} by assistant-turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} by image-capability variant` : ""}${plan.byTwin > 0 ? `, ${plan.byTwin} by rewritten-id twin` : ""}) onto churned bytes, ${plan.unmatched.length} unmatched re-enter the wire unfolded${plan.idRewriteSuspects > 0 ? `; ${plan.idRewriteSuspects} suspected host-rewritten tool-call ids (identical content under a different toolCallId — #2396)` : ""} (#1921)${driftTok}`);
         } else if (plan.claims.size > 0) {
             opts.log("warn",
-                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
+                `${tag}[fold-reconcile] resent history drifted: ${plan.claims.size + plan.unmatched.length} covered id(s) missing, ${plan.claims.size} matchable by anchor (${plan.byPos} positional, ${plan.byTool} toolCallId, ${plan.byNorm} normalized${plan.byTurn > 0 ? `, ${plan.byTurn} turn key` : ""}${plan.byImage > 0 ? `, ${plan.byImage} image` : ""}${plan.byTwin > 0 ? `, ${plan.byTwin} rewritten-id twin` : ""}) but reconcile=warn made no repair (#1921)${driftTok}`);
         } else if (reasoningOnlyDrop) {
             opts.log("info",
                 `${tag}[fold-reconcile] ${plan.unmatched.length} covered reasoning core(s) dropped by the host (cross-model replay discards structured thinking; every text/tool core intact) — fold substrate healthy, tolerated (#2193 follow-up)`);
@@ -1317,6 +1385,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byNorm: plan.byNorm,
         byTurn: plan.byTurn,
         byImage: plan.byImage,
+        byTwin: plan.byTwin,
         reaped: reapedCount,
         unmatched: plan.unmatched.length,
     };
